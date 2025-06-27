@@ -1,0 +1,4 @@
+pwsh-ast-parser
+requests
+beautifulsoup4
+pytest
