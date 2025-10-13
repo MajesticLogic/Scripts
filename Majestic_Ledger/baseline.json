@@ -1,0 +1,34 @@
+{
+  "version": "2025-10-13",
+  "description": "Host-user baseline",
+  "hosts": [
+    {
+      "hostname": "host-win-01",
+      "ip": "10.0.0.12",
+      "platform": "windows",
+      "allowed_users": [
+        "Administrator",
+        "svc_backup",
+        "alice"
+      ],
+      "winrm": {
+        "user": "mr.majestic",
+        "password": "redacted"
+      }
+    },
+    {
+      "hostname": "host-linux-01",
+      "ip": "10.0.1.22",
+      "platform": "linux",
+      "allowed_users": [
+        "root",
+        "sysadmin",
+        "bob"
+      ],
+      "ssh": {
+        "user": "mr.majestic",
+        "ssh_key": "C:/Users/mr.majestic/.ssh/id_rsa"
+      }
+    }
+  ]
+}
