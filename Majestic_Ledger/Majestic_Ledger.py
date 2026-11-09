@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Majestic_Ledger.py  (v1.3)
+Majestic_Ledger.py  (v1.4)
 
 Scan hosts (Linux via ssh, Windows via WinRM), compare against baseline,
 and interactively request approval to remediate out-of-baseline local accounts.
@@ -17,15 +17,11 @@ v1.2:
 - Retry logic: Try up to 3 times per host before skipping.
 - Log unreachable hosts to remediation_log_UTC.jsonl.
 
-v1.3:
-- Password rotation for *allowed_users* local accounts:
-  --rotate-passwords [--password-file PATH] [--pw-length N]
-  - Linux: chpasswd via stdin
-  - Windows: Set-LocalUser with SecureString
-  - Per-account explicit approval (APPROVE ROTATE)
-  - Passwords saved locally to CSV; never printed to console
+v1.4:
+- Password rotation is disabled until a secure recovery and storage flow exists.
+- The old mode wrote new passwords to an unencrypted CSV.
 """
-import json, argparse, subprocess, shlex, sys, os, datetime, getpass, time, secrets, string, csv, stat
+import json, argparse, subprocess, shlex, sys, os, datetime, getpass, time
 from typing import List, Dict, Any, Optional
 
 try:
@@ -221,70 +217,6 @@ try {{
     except Exception as e:
         return {"error":"winrm_exception", "detail":str(e)}
 
-def gen_password(length: int = 24) -> str:
-    alphabet = (string.ascii_letters + string.digits + "!@#$%^&*()_-+=[]{}:,./?")
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-def init_password_file(path: str):
-    new_file = not os.path.exists(path)
-    try:
-        os.umask(0o177)
-    except Exception:
-        pass
-    if new_file:
-        with open(path, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(["time_utc","host","ip","platform","username","password"])
-        try:
-            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-        except Exception:
-            pass
-
-def write_password_record(path: str, host: str, ip: str, platform: str, username: str, password: str):
-    with open(path, "a", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow([datetime.datetime.utcnow().isoformat()+"Z", host, ip, platform, username, password])
-
-def linux_set_password_via_ssh(ip: str, account: str, new_password: str, ssh_user: Optional[str]=None, ssh_key: Optional[str]=None) -> Dict[str,Any]:
-    target = f"{ssh_user}@{ip}" if ssh_user else ip
-    cmd = "sudo chpasswd"
-    ssh_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
-    if ssh_key:
-        ssh_cmd += ["-i", os.path.expanduser(ssh_key)]
-    ssh_cmd += [target, cmd]
-    try:
-        to_send = f"{account}:{new_password}\n"
-        proc = subprocess.run(ssh_cmd, input=to_send, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
-        return {"rc": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
-    except Exception as e:
-        return {"error":"ssh_exec_exception", "detail": str(e)}
-
-def windows_set_password_via_winrm(ip: str, winrm_user: str, winrm_pass: str, account: str, new_password: str, transport: str="ntlm") -> Dict[str,Any]:
-    if not HAVE_WINRM:
-        return {"error":"pywinrm_not_installed"}
-    try:
-        session = winrm.Session(target=ip, auth=(winrm_user, winrm_pass), transport=transport)
-        ps = f"""
-$u = "{account}"
-$pw = "{new_password}"
-try {{
-  $sec = ConvertTo-SecureString -String $pw -AsPlainText -Force
-  if (Get-Command -Name Set-LocalUser -ErrorAction SilentlyContinue) {{
-    Set-LocalUser -Name $u -Password $sec
-  }} else {{
-    net user "$u" "$pw"
-  }}
-  Write-Output "OK"
-}} catch {{
-  Write-Output ("ERR: " + $_.Exception.Message)
-  exit 1
-}}
-"""
-        r = session.run_ps(ps)
-        return {"rc": r.status_code, "stdout": r.std_out.decode('utf-8', errors='ignore'), "stderr": r.std_err.decode('utf-8', errors='ignore')}
-    except Exception as e:
-        return {"error":"winrm_exception","detail":str(e)}
-
 def interactive_prompt(prompt_text: str) -> str:
     try:
         return input(prompt_text).strip()
@@ -367,7 +299,7 @@ def inspect_host_and_prompt(host: Dict[str,Any], discovered_users: List[Dict[str
 
         elif platform == "windows":
             winrm_user = global_opts.get("winrm_user") or per_host_winrm.get("user")
-            winrm_pass = global_opts.get("winrm_pass") or per_host_winrm.get("password")
+            winrm_pass = global_opts.get("winrm_pass")
             if not (winrm_user and winrm_pass):
                 print("No WinRM credentials for this host; cannot remediate. Skipping.")
                 log_entry({"host": name, "ip": ip, "username": uname, "action": "no_winrm_creds", "operator": getpass.getuser()})
@@ -390,101 +322,47 @@ def inspect_host_and_prompt(host: Dict[str,Any], discovered_users: List[Dict[str
         print("Action result:", result)
         log_entry({"host": name, "ip": ip, "username": uname, "action": chosen, "result": result, "operator": getpass.getuser()})
 
-def rotate_allowed_users_for_host(host: Dict[str,Any], global_opts: Dict[str,Any], pw_len: int, pw_file: str):
-    ip = host.get("ip")
-    name = host.get("hostname")
-    platform = (host.get("platform") or "").lower()
-    allowed_users = host.get("allowed_users", []) or []
-
-    if not allowed_users:
-        return
-
-    print(f"\n*** Password rotation on {name} ({ip}) [{platform}] for {len(allowed_users)} allowed user(s) ***")
-
-    if not global_opts.get("execute"):
-        print("DRY-RUN: Rotation requested but --execute not set. No changes will be made.")
-        return
-
-    for acct in allowed_users:
-        acct = acct.strip()
-        if not acct:
-            continue
-
-        prompt = f"Rotate password for '{acct}' on {name}? Type: APPROVE ROTATE  (or press Enter to skip): "
-        if interactive_prompt(prompt) != "APPROVE ROTATE":
-            print(f"  Skipped {acct}.")
-            log_entry({"host": name, "ip": ip, "username": acct, "action": "rotate_skipped", "operator": getpass.getuser()})
-            continue
-
-        new_pw = gen_password(pw_len)
-
-        result = None
-        if platform == "linux":
-            ssh_user = (host.get("ssh") or {}).get("user") or global_opts.get("ssh_user")
-            ssh_key  = (host.get("ssh") or {}).get("ssh_key") or global_opts.get("ssh_key")
-            result = linux_set_password_via_ssh(ip, acct, new_pw, ssh_user=ssh_user, ssh_key=ssh_key)
-        elif platform == "windows":
-            winrm_user = (host.get("winrm") or {}).get("user") or global_opts.get("winrm_user")
-            winrm_pass = (host.get("winrm") or {}).get("password") or global_opts.get("winrm_pass")
-            if not (winrm_user and winrm_pass):
-                print("  No WinRM creds for this host; cannot rotate.")
-                log_entry({"host": name, "ip": ip, "username": acct, "action": "rotate_no_winrm_creds", "operator": getpass.getuser()})
-                continue
-            result = windows_set_password_via_winrm(ip, winrm_user, winrm_pass, acct, new_pw)
-        else:
-            print(f"  Unsupported platform {platform}; skipping.")
-            log_entry({"host": name, "ip": ip, "username": acct, "action": "rotate_unsupported_platform", "platform": platform, "operator": getpass.getuser()})
-            continue
-
-        ok = isinstance(result, dict) and result.get("rc", 1) == 0 and "error" not in result
-        if ok:
-            write_password_record(pw_file, name, ip, platform, acct, new_pw)
-            print(f"  Rotated {acct} ✔ (saved to {pw_file})")
-            log_entry({"host": name, "ip": ip, "username": acct, "action": "password_rotated", "result": {"rc": result.get("rc", 0)}})
-        else:
-            print(f"  Rotation failed for {acct}: {result}")
-            log_entry({"host": name, "ip": ip, "username": acct, "action": "password_rotate_failed", "result": result, "operator": getpass.getuser()})
-
 def main():
     p = argparse.ArgumentParser(description="Baseline scanner and interactive remediation assistant")
     p.add_argument("--baseline", required=True, help="Path to baseline JSON")
     p.add_argument("--ssh-user", help="Default SSH user for Linux hosts")
     p.add_argument("--ssh-key", help="Default SSH key path for Linux hosts")
     p.add_argument("--winrm-user", help="Default WinRM user for Windows hosts")
-    p.add_argument("--winrm-pass", help="Default WinRM password for Windows hosts (or leave blank to prompt)")
-    p.add_argument("--execute", action="store_true", help="Allow remediation/rotation actions (default: dry-run)")
+    p.add_argument("--winrm-pass", help=argparse.SUPPRESS)
+    p.add_argument("--execute", action="store_true", help="Allow remediation actions (default: dry-run)")
     p.add_argument("--timeout", type=int, default=10, help="SSH/WinRM connection timeout seconds (used for ssh)")
     p.add_argument("--update-hostnames", action="store_true", help="Write discovered hostnames back into the baseline")
     p.add_argument("--baseline-out", help="Optional path to write updated baseline if --update-hostnames is set")
-    p.add_argument("--rotate-passwords", action="store_true", help="Rotate passwords for allowed_users (local accounts only)")
-    p.add_argument("--password-file", default="rotated_passwords_UTC.csv", help="Local CSV file to save rotated passwords")
-    p.add_argument("--pw-length", type=int, default=24, help="Password length for rotation")
+    p.add_argument("--rotate-passwords", action="store_true", help="Disabled: unsafe plaintext password output in older versions")
 
     args = p.parse_args()
+    if args.rotate_passwords:
+        p.error("password rotation is disabled until secure credential storage is implemented; no host changes or password files were made")
+    if args.winrm_pass is not None:
+        p.error("--winrm-pass is disabled because command-line passwords can be exposed; enter the password at the hidden prompt")
+    if args.update_hostnames and os.path.basename(os.path.realpath(args.baseline)).lower() == "baseline.example.json":
+        example_path = os.path.normcase(os.path.realpath(args.baseline))
+        output_path = os.path.normcase(os.path.realpath(args.baseline_out or args.baseline))
+        if output_path == example_path:
+            p.error("the published example baseline is read-only; copy it to baseline.local.json or specify a different --baseline-out path")
 
     baseline = load_baseline(args.baseline)
     hosts = baseline.get("hosts", [])
+    if any("password" in (host.get("winrm") or {}) for host in hosts):
+        p.error("baseline contains winrm.password; remove stored passwords and enter them at the hidden prompt")
 
     global_opts = {
         "ssh_user": args.ssh_user,
         "ssh_key": args.ssh_key,
         "winrm_user": args.winrm_user,
-        "winrm_pass": args.winrm_pass,
         "execute": args.execute,
         "timeout": args.timeout
     }
 
-    if args.winrm_user and args.winrm_pass is None:
-        args.winrm_pass = getpass.getpass(prompt="WinRM password (will reuse for all Windows hosts without per-host creds): ")
-        global_opts["winrm_pass"] = args.winrm_pass
-
     dirty = False
 
-    if args.rotate_passwords:
-        init_password_file(args.password_file)
-        print(f"Password file: {args.password_file}  (ensure this lives on an encrypted volume with restricted access)")
-
     for host in hosts:
+        host_opts = dict(global_opts)
         ip = host.get("ip")
         plat = (host.get("platform") or "").lower()
         allowed = lowercase_set(host.get("allowed_users", []))
@@ -511,21 +389,27 @@ def main():
 
         elif plat == "windows":
             winrm_user = per_winrm.get("user") or global_opts.get("winrm_user")
-            winrm_pass = per_winrm.get("password") or global_opts.get("winrm_pass")
-            if not winrm_user or not winrm_pass:
-                print("No WinRM creds available for this Windows host; will only enumerate if possible.")
+            if not winrm_user:
+                print("No WinRM username available for this Windows host; skipping enumeration.")
                 discovered = [{"error":"no_winrm_creds_for_host"}]
             else:
-                actual_hn = get_windows_hostname_via_winrm(ip, winrm_user, winrm_pass)
-                if actual_hn and actual_hn != host.get("hostname"):
-                    print(f"  Hostname mismatch: baseline '{host.get('hostname')}' → discovered '{actual_hn}'")
-                    host["hostname"] = actual_hn
-                    dirty = True
-                discovered = with_retries(
-                    enum_windows_users_via_winrm,
-                    ip=ip, winrm_user=winrm_user, winrm_pass=winrm_pass,
-                    err_is_retry=looks_like_error_list
-                )
+                winrm_pass = getpass.getpass(prompt=f"WinRM password for {winrm_user} on {host.get('hostname')}: ")
+                if not winrm_pass:
+                    print("No WinRM password entered; skipping enumeration.")
+                    discovered = [{"error":"no_winrm_creds_for_host"}]
+                else:
+                    actual_hn = get_windows_hostname_via_winrm(ip, winrm_user, winrm_pass)
+                    if actual_hn and actual_hn != host.get("hostname"):
+                        print(f"  Hostname mismatch: baseline '{host.get('hostname')}' → discovered '{actual_hn}'")
+                        host["hostname"] = actual_hn
+                        dirty = True
+                    discovered = with_retries(
+                        enum_windows_users_via_winrm,
+                        ip=ip, winrm_user=winrm_user, winrm_pass=winrm_pass,
+                        err_is_retry=looks_like_error_list
+                    )
+                    host_opts["winrm_user"] = winrm_user
+                    host_opts["winrm_pass"] = winrm_pass
         else:
             print("Unsupported platform; skipping.")
             log_entry({"host": host.get("hostname"), "ip": ip, "action": "unsupported_platform", "platform": plat})
@@ -535,10 +419,7 @@ def main():
             log_entry({"host": host.get("hostname"), "ip": ip, "platform": plat, "action": "host_unreachable", "error": discovered[0]})
             continue
 
-        inspect_host_and_prompt(host, discovered, allowed, global_opts)
-
-        if args.rotate_passwords:
-            rotate_allowed_users_for_host(host, global_opts, args.pw_length, args.password_file)
+        inspect_host_and_prompt(host, discovered, allowed, host_opts)
 
     if args.update_hostnames and dirty:
         out_path = args.baseline_out or args.baseline
