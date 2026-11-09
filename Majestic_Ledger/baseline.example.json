@@ -1,0 +1,30 @@
+{
+  "version": "example-1",
+  "description": "Fictional example only. Replace TEST-NET addresses in an ignored local copy.",
+  "hosts": [
+    {
+      "hostname": "example-win-01",
+      "ip": "192.0.2.10",
+      "platform": "windows",
+      "allowed_users": [
+        "Administrator",
+        "example-operator"
+      ],
+      "winrm": {
+        "user": "example-admin"
+      }
+    },
+    {
+      "hostname": "example-linux-01",
+      "ip": "192.0.2.20",
+      "platform": "linux",
+      "allowed_users": [
+        "root",
+        "example-operator"
+      ],
+      "ssh": {
+        "user": "example-admin"
+      }
+    }
+  ]
+}

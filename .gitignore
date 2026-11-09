@@ -1,0 +1,9 @@
+# Local Majestic Ledger inventories and generated records. These patterns do
+# not encrypt files or remove anything already committed to Git history.
+**/baseline.json
+**/baseline.local.json
+**/baseline.*.local.json
+**/remediation_log*.jsonl
+**/rotated_passwords*.csv
+**/__pycache__/
+**/*.pyc
